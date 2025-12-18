@@ -1,0 +1,201 @@
+---
+title: "mouse_receptor_analysis"
+author: "Martin Kinisu"
+output: html_document
+date: "2025-12-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE,fig.height=10, fig.width=14)
+```
+
+## mMO151_MFTAv2.2_mouse_final.RDS
+
+The goal of this work is to identify mouse receptors that are ideally specific, or at least enriched in mMO germ cells<br>
+
+In the analysis below, we:<br>
+1. read in the mMO151_MFTAv2.2_mouse_final.RDS<br>
+2. inspect the labeled cell types<br>
+3. subset the data to cell types of interest<br>
+4. perform top marker identification<br>
+5. perform differential expression analysis<br>
+
+
+```{r libraries}
+library(googleCloudStorageR)
+library(gargle)
+library(googleAuthR)
+library(monocle3)
+library(dplyr)
+library(patchwork)
+library(ggplot2)
+
+```
+
+```{r gcloud aut}
+scope <-c("https://www.googleapis.com/auth/cloud-platform")
+token <- token_fetch(scopes = scope)
+
+```
+
+
+```{r functions}
+
+read_rds_from_gcs <- function(object_name, bucket = "cc-analysis-archive") {
+  # Authenticate with GCS
+  gcs_auth(token=token)  # or gcs_auth("path/to/service_account.json")
+  # Set the default bucket
+  gcs_global_bucket(bucket)
+  # Create a temporary file and register cleanup
+  tmp_file <- tempfile(fileext = ".RDS")
+  on.exit(unlink(tmp_file), add = TRUE)
+  # Download the RDS file from GCS
+  gcs_get_object(object_name, saveToDisk = tmp_file, overwrite = TRUE)
+  # Read the RDS into memory
+  readRDS(tmp_file)
+}
+
+
+#takes cds and returns top specific marker IDs among mouse receptors
+run_top_markers <- function(cds){
+  cds_temp <- cds[rowData(cds)$gene_short_name %in% mouse_receptors,]
+  marker_test_res <- top_markers(cds_temp, group_cells_by = "partition", reference_cells =  1000, cores = 8)
+  #filter marker genes by expression and specificity
+  top_specific_markers <- marker_test_res %>%
+    filter(fraction_expressing >= 0.1) %>%
+    group_by(cell_group) %>%
+    top_n(5, pseudo_R2)
+  
+  #Grab IDs of group markers
+  top_specific_marker_ids <- unique(top_specific_markers %>% pull(gene_id))
+  
+  return(top_specific_marker_ids)
+  
+}
+
+#run DEG analysis, return model fit coeficients
+find_DEGs <- function(cds_subset){
+  cds_subset_temp <- cds_subset[rowData(cds_subset)$gene_short_name %in% mouse_receptors, ]
+  cds_subset_temp <- estimate_size_factors(cds_subset_temp)
+  gene_fits <- fit_models(cds_subset_temp, model_formula_str = "~partition")
+  fit_coefs <- coefficient_table(gene_fits)
+  
+  
+  return(fit_coefs) 
+  
+}
+```
+
+```{r load mMO151 dataset}
+#read in mouse mMO cds object
+mMO_cds <- read_rds_from_gcs(object_name = "Mouse_10X_reports/mMO151_MFTAv2.2/mMO151_MFTAv2.2_mouse_final.RDS",
+                         bucket = "cc-analysis-archive")
+
+meta <- colData(mMO_cds)
+```
+
+
+```{r inspect}
+#plot cells and color by assigned cell type
+plot_cells(mMO_cds, color_cells_by = "assigned_cell_type", label_cell_groups = TRUE, group_label_size = 3)+
+  labs(title = "whole picture")
+
+
+#plot cells and color by dataset
+plot_cells(mMO_cds, color_cells_by = "dataset", label_cell_groups = TRUE, group_label_size = 4)+
+  labs(title = "datasets")
+```
+```{r subset and plot}
+invitro_cds <- mMO_cds[,colData(mMO_cds)$dataset == "InVitro"]
+atlas_cds <- mMO_cds[,colData(mMO_cds)$dataset == "MFTAv2.2"]
+
+#only keep granulosa and germ from atlas samples
+meta_invitro <- colData(invitro_cds)
+meta_atlas <- colData(atlas_cds)
+keep_cells <- c("adult granulosa", "pre-granulosa", "PGC/germ")
+atlas_cds_sub <- atlas_cds[,meta_atlas$assigned_cell_type %in% keep_cells]
+
+
+
+#plot subset cds and color by assigned cell types
+plot_cells(invitro_cds,color_cells_by = "assigned_cell_type", label_cell_groups = FALSE, group_label_size = 3 )+
+  labs(title = "mMO151 assigned_cell_types")
+
+plot_cells(invitro_cds,color_cells_by = "partition", label_cell_groups = FALSE, group_label_size = 3 )+
+  labs(title = "mMO151 partitions")
+
+plot_cells(atlas_cds_sub,color_cells_by = "assigned_cell_type", label_cell_groups = FALSE, group_label_size = 3 )+
+  labs(title = "MFTAv2.2 assigned cell types")
+
+```
+Because of few germ cells across mMO151, will keep d4 and d6 mMOs together for downstream analyses<br>
+
+```{r find and plot top markers, results='hide'}
+#find top markers among mouse receptor list
+mouse_receptors <- mouse_receptors <- read.csv("mouse_receptors.csv")
+mouse_receptors <- mouse_receptors$x
+
+#
+invitro_top_marker_ids <- run_top_markers(invitro_cds)
+atlas_top_marker_ids <- run_top_markers(atlas_cds_sub)
+
+plot_genes_by_group(invitro_cds, invitro_top_marker_ids, group_cells_by = "partition", ordering_type = "maximal_on_diag", max.size = 3)+
+  labs(title = "mMO151 partition markers")
+
+plot_genes_by_group(atlas_cds_sub, atlas_top_marker_ids, group_cells_by = "assigned_cell_type", ordering_type = "maximal_on_diag", max.size = 3)+
+  labs(title = "MFTAv2.2 assigned cell type markers")
+```
+We find that Tex101 is a specific marker of germ cells in both the fetal atlas and mMO151<br>
+Note that partition 2 in mMO151 corresponds to PGC/Germ cells<br>
+Plots above show the Top 5 markers<br>
+
+```{r plot Tex101 on UMAP}
+plot_cells(invitro_cds, genes = c("Tex101"), scale_to_range = FALSE)+
+  labs(title = "Tex101 mMO151 UMAP")
+plot_cells(atlas_cds_sub, genes = c("Tex101"), scale_to_range = FALSE)+
+  labs(title = "Tex101 MFTAv2.2 UMAP")
+
+```
+While Tex101 appears to be a specific marker of germ cells, can we identify other receptors that are<br>
+significantly enriched among germ cells?<br>
+
+```{r DGE analysis and viz, results='hide'}
+invitro_coeffs <- find_DEGs(invitro_cds)
+atlas_coeffs <- find_DEGs(atlas_cds_sub)
+
+invitro_germ_coeffs <- invitro_coeffs %>%
+  filter(term == "partition2") %>%
+  arrange(q_value)
+
+invitro_germ_markers <- invitro_germ_coeffs %>%
+  filter(q_value < 0.05, estimate > 4)
+
+invitro_top <- invitro_germ_markers %>%
+  slice_head(n = 20) %>%
+  pull(gene_short_name)
+
+#partition2 also corresponds to Germ cells in atlas
+atlas_germ_coeffs <- atlas_coeffs %>%
+  filter(term == "partition2") %>%
+  arrange(q_value)
+
+atlas_germ_markers <- atlas_germ_coeffs %>%
+  filter(q_value < 0.05, estimate > 4)
+
+atlas_top <- atlas_germ_markers %>%
+  slice_head(n = 20) %>%
+  pull(gene_short_name)
+
+plot_genes_by_group(invitro_cds, invitro_top, group_cells_by = "partition", ordering_type = "maximal_on_diag")+
+  labs(title = "mMO151 DE genes")
+plot_cells(invitro_cds, genes = invitro_top, scale_to_range = FALSE)+
+  labs(title = "mMO151 DE genes")
+plot_genes_by_group(atlas_cds_sub, atlas_top, group_cells_by = "assigned_cell_type", ordering_type = "maximal_on_diag")+
+  labs(title = "MFTAv2.2 DE genes")
+plot_cells(atlas_cds_sub, genes = atlas_top, scale_to_range = FALSE)+
+  labs(title = "MFTAv2.2 DE genes")
+```
+
+
+
+
