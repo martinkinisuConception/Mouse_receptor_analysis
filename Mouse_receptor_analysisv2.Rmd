@@ -1,0 +1,198 @@
+---
+title: "mouse_receptor_analysisv2"
+output: html_document
+date: "2025-12-18"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE,fig.height=10, fig.width=14)
+```
+
+## mMO151_MFTAv2.2_mouse_final.RDS
+
+The goal of this work is to identify mouse receptors that are ideally specific, or at least enriched in mMO germ cells<br>
+
+In the analysis below, we:<br>
+Read in the mMO151_MFTAv2.2_mouse_final.RDS and either germ = Yes or germ = No
+Attempted to run DGE analysis (fit_models()) on a downsampled atlas + entire mMO cds 
+However, this led to memory issues. Moving forward I ran DGE analysis using just the mMO subset.
+The DGE results were filtered to only considered genes that are present in the mouse receoptors list.
+Finally, results were filtered by lFC (estimate) and q_value (corrected p-value) and plotted for visualization.
+
+
+
+```{r libraries}
+library(googleCloudStorageR)
+library(gargle)
+library(googleAuthR)
+library(monocle3)
+library(dplyr)
+library(patchwork)
+library(ggplot2)
+
+```
+
+```{r gcloud aut}
+scope <-c("https://www.googleapis.com/auth/cloud-platform")
+token <- token_fetch(scopes = scope)
+
+```
+
+
+```{r functions}
+
+read_rds_from_gcs <- function(object_name, bucket = "cc-analysis-archive") {
+  # Authenticate with GCS
+  gcs_auth(token=token)  # or gcs_auth("path/to/service_account.json")
+  # Set the default bucket
+  gcs_global_bucket(bucket)
+  # Create a temporary file and register cleanup
+  tmp_file <- tempfile(fileext = ".RDS")
+  on.exit(unlink(tmp_file), add = TRUE)
+  # Download the RDS file from GCS
+  gcs_get_object(object_name, saveToDisk = tmp_file, overwrite = TRUE)
+  # Read the RDS into memory
+  readRDS(tmp_file)
+}
+
+
+#takes cds and returns top specific marker IDs among mouse receptors
+run_top_markers <- function(cds){
+  cds_temp <- cds[rowData(cds)$gene_short_name %in% mouse_receptors,]
+  marker_test_res <- top_markers(cds_temp, group_cells_by = "partition", reference_cells =  1000, cores = 8)
+  #filter marker genes by expression and specificity
+  top_specific_markers <- marker_test_res %>%
+    filter(fraction_expressing >= 0.1) %>%
+    group_by(cell_group) %>%
+    top_n(5, pseudo_R2)
+  
+  #Grab IDs of group markers
+  top_specific_marker_ids <- unique(top_specific_markers %>% pull(gene_id))
+  
+  return(top_specific_marker_ids)
+  
+}
+
+#run DEG analysis, return model fit coeficients
+find_DEGs <- function(cds_subset){
+  cds_subset_temp <- cds_subset[rowData(cds_subset)$gene_short_name %in% mouse_receptors, ]
+  cds_subset_temp <- estimate_size_factors(cds_subset_temp)
+  gene_fits <- fit_models(cds_subset_temp, model_formula_str = "~partition")
+  fit_coefs <- coefficient_table(gene_fits)
+  
+  
+  return(fit_coefs) 
+  
+}
+```
+
+```{r load in mouse receptors}
+mouse_receptors <- mouse_receptors <- read.csv("mouse_receptors.csv")
+mouse_receptors <- mouse_receptors$x
+
+```
+
+
+```{r load mMO151 dataset}
+#read in mouse mMO cds object
+mMO_cds <- read_rds_from_gcs(object_name = "Mouse_10X_reports/mMO151_MFTAv2.2/mMO151_MFTAv2.2_mouse_final.RDS",
+                         bucket = "cc-analysis-archive")
+
+meta <- colData(mMO_cds)
+```
+We find there are two datasets in this cds, Invitro and MFTAv2.2.
+They are well mixed asside from immune / endothelial cell calls.
+
+```{r inspect}
+#plot cells and color by assigned cell type
+plot_cells(mMO_cds, color_cells_by = "assigned_cell_type", label_cell_groups = TRUE, group_label_size = 3)+
+  labs(title = "whole picture")
+
+
+#plot cells and color by dataset
+plot_cells(mMO_cds, color_cells_by = "dataset", label_cell_groups = TRUE, group_label_size = 4)+
+  labs(title = "datasets")
+```
+
+
+To identify germ enriched genes. We first define a variable "germ" and assign cells either Yes or No 
+Depending on whether their assigned_cell_type / partition belongs to PGC/germ.
+```{r in joined cds, manually flag cells as germ v not_germ}
+#we see that clusters 5 and 7 correspond to PGC/germ cells
+p1 <- plot_cells(mMO_cds, color_cells_by = "assigned_cell_type", group_label_size = 3)
+p2 <- plot_cells(mMO_cds, color_cells_by = "cluster", group_label_size = 3)
+
+
+#edit meta data to include germ_not_germ variable
+#Editing this cell block should return value of subsetted cds 
+meta$germ <- meta$clusters
+meta$germ <- dplyr::recode(
+  meta$germ,
+  "1" = "No",
+  "2" = "No",
+  "3" = "No",
+  "4" = "No",
+  "5" = "Yes",
+  "6" = "No",
+  "7" = "Yes",
+  "8" = "No",
+  "9" = "No",
+  "10" = "No",
+  "11" = "No",
+  "12" = "No"
+)
+
+colData(mMO_cds)$germ <- meta$germ
+colData(mMO_cds)$germ <- factor(
+  colData(mMO_cds)$germ, levels = c("No", "Yes")
+)
+
+p3 <- plot_cells(mMO_cds, color_cells_by = "germ", group_label_size = 3)
+wrap_plots(p1, p2, p3)
+```
+Now we run DGE analysis. Attempts to include a down-sampled portion of the MFTAv2.2 and run 
+DGE analysis on a combined object continually hit memory limit issues. However, because the datasets
+are well mixed, and becasue the InVitro subset itself has thousands of cells it is reasonable to run DGE analysis on just the InVitro subset.
+
+```{r find all DEGs germ vs not_germ, results='hide'}
+#atlas_cds is too large to locally run DE analysis, need to down sample
+
+invitro <- which(meta$dataset == "InVitro")
+atlas <- which(meta$dataset == "MFTAv2.2")
+
+
+cells_to_keep <- c(invitro)
+
+mMO_only <- mMO_cds[, cells_to_keep]
+sampled_meta <- colData(mMO_only)
+
+#calling fit_models on atlas downsampled (even down to 0.1) + mMO results in memory limit error
+#calling fit_models on only mMO results works
+germ_v_ngerm_fits <- fit_models(mMO_only, model_formula_str = "~germ")
+
+
+
+```
+
+After DGE analysis, we filter by lfc >3 and q_value < 0.05. 
+Next, we subset the results to only consider genes identified as mouse receptors. Finally, we plot the results. 
+```{r Extract results of interest and plot for viz}
+#Extract and sort DGE analysis results and plot
+germ_vngerm_coeffs <- coefficient_table(germ_v_ngerm_fits)
+
+germ_coeffs <- germ_vngerm_coeffs %>%
+  filter(gene_short_name %in% mouse_receptors, estimate > 3, q_value < 0.05)%>%
+  arrange(q_value)
+
+germ_top <- germ_coeffs %>%
+  slice_head(n = 10) %>%
+  pull(gene_short_name)
+
+p1 <- plot_genes_by_group(mMO_only, group_cells_by = "germ", germ_top, ordering_type = "maximal_on_diag") +
+  labs(title = "mMO only")
+p2 <- plot_cells(mMO_only, genes = germ_top, scale_to_range = FALSE)+
+  labs(title = "mMO only")
+
+wrap_plots(p1, p2)
+
+```
+We can see that Tex101 is a good candidate for a receptor/surface marker that is predominantly expressed in the PGC/Germ compartment. Other candidates have similar enrichment/specificity, but much lower relative expression. 
